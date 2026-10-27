@@ -53,4 +53,4 @@ Score (cosine similarity), file and line range, the section's headings or the do
 - The first run downloads the model (176 MB) and, on macOS, llama.cpp (16 MB) into `~/.cache/doc-search`, each checked against a pinned SHA-256. The container images are pinned by digest. Each project's index lives in the same cache, never in the project.
 - `DOC_SEARCH_BACKEND=native|cpu|cuda|rocm|vulkan` forces a backend, `DOC_SEARCH_ENGINE=docker|podman` an engine, `DOC_SEARCH_PORT` the native server's port (8091). A GPU container that fails to start falls back to the CPU.
 - Stuck on "Waiting for llama.cpp": `search status` names the log.
-- To have it in every project, copy this directory to `~/.claude/skills/doc-search`.
+- To have it in every project, copy this directory to your agent's personal skills folder: `~/.agents/skills/` for Codex, Cursor and Gemini CLI, `~/.claude/skills/` for Claude Code, `~/.gemini/config/skills/` for Antigravity.
