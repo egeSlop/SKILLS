@@ -1,8 +1,10 @@
-"""Strip comments from client-side source: CSS, JS/TS and Vue SFC blocks.
+"""Strip comments from client-side source: CSS, JS/TS, Vue and Svelte components, HTML and Blade.
 
 Usage: strip_comments.py FILE...
 Keeps tool directives (@vite-ignore, __PURE__, eslint, @ts-*). Whole-line
 comments go with their line; the blank line a removed block leaves collapses.
+JSX and TSX are skipped: text between tags can hold quotes and slashes that only
+a real parser tells apart from code, so remove those comments by hand.
 Rebuild afterwards and compare the minified output with the previous build.
 """
 import re
@@ -181,6 +183,10 @@ def strip_html(src: str) -> str:
     return tidy(re.sub(r'<!--.*?-->', '\x00BC', src, flags=re.S))
 
 
+def strip_blade(src: str) -> str:
+    return tidy(re.sub(r'\{\{--.*?--\}\}|<!--.*?-->', '\x00BC', src, flags=re.S))
+
+
 GAP = object()
 
 
@@ -246,12 +252,19 @@ def strip_vue(src: str) -> str:
 for name in sys.argv[1:]:
     p = pathlib.Path(name)
     src = p.read_text()
-    if p.suffix == '.css':
+    if p.name.endswith('.blade.php'):
+        new = strip_blade(src)
+    elif p.suffix in ('.css', '.scss', '.less'):
         new = strip_css(src)
-    elif p.suffix in ('.js', '.ts', '.mjs'):
+    elif p.suffix in ('.js', '.ts', '.mjs', '.cjs'):
         new = strip_js(src)
-    elif p.suffix == '.vue':
+    elif p.suffix in ('.vue', '.svelte'):
         new = strip_vue(src)
+    elif p.suffix == '.html':
+        new = strip_html(src)
+    elif p.suffix in ('.jsx', '.tsx'):
+        print(f'{name}: skipped, remove JSX/TSX comments by hand', file=sys.stderr)
+        continue
     else:
         continue
     if not new.endswith('\n'):

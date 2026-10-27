@@ -1,6 +1,6 @@
 ---
 name: laravel-audit-sweep
-description: Audit a range of commits (or a whole Laravel codebase) against a fixed rulebook, fix what it finds, prove each fix, and write a report. Use when the user asks for an "audit sweep", "audit the new commits", "sweep main", or to check a Laravel/Filament/Inertia project against the house rules before a merge or deploy.
+description: Audit a range of commits (or a whole Laravel codebase) against a fixed rulebook, fix what it finds, prove each fix, and write a report. Works with Laravel at the repository root or in a monorepo folder, and with Blade, Livewire, Filament or Inertia front ends in Vue, React or Svelte. Use when the user asks for an "audit sweep", "audit the new commits", "sweep main", or to check a Laravel project against the house rules before a merge or deploy.
 ---
 
 # Laravel audit sweep
@@ -8,10 +8,15 @@ description: Audit a range of commits (or a whole Laravel codebase) against a fi
 A sweep is: pick a range, get a green baseline, scan every added line against
 `RULES.md`, read the risky code by hand, fix, prove each fix by breaking it,
 run everything, report. Rules live in `RULES.md` next to this file. Read it
-before starting.
+before starting. `<skill>` below is this skill's directory.
 
 ## 0. Ground rules
 
+- **The project's own instructions come first.** Read its `AGENTS.md`,
+  `CLAUDE.md`, `CONTRIBUTING` and README. Where its rules differ from
+  `RULES.md`, the project wins. They also say how commands run: on the host,
+  through Sail, Docker Compose or a dev wrapper. Use that way for every PHP,
+  Composer and Node command below.
 - **Work in a git worktree on a new branch** (`audit/sweep-MMDD`). Never touch
   the main checkout's working tree; someone else may have uncommitted work
   there. Never use bare `git stash`.
@@ -42,32 +47,46 @@ git worktree add ../<repo>-audit -b audit/sweep-$(date +%m%d) origin/main
 For a first sweep of a whole project, use the empty tree as the base:
 `BASE=$(git hash-object -t tree /dev/null)`.
 
+In a monorepo, note which folder holds the Laravel app (the one with
+`artisan`) and which hold front-end apps and packages.
+
 ## 2. Baseline
 
 Run the full suite **on the production database engine** before changing
 anything, so you know which failures were already there.
 
-- Postgres in docker: raise `max_locks_per_transaction` (1024) and
+- Postgres in a container: raise `max_locks_per_transaction` (1024) and
   `max_connections` (300) for parallel runs; `fsync=off` is fine for tests.
 - Force `QUEUE_CONNECTION=sync` and `CACHE_STORE=array` unless a test needs
   otherwise. A redis queue with no worker silently drops queued writes.
 - `php artisan test --parallel --processes=<cores>`.
-- Also: `vendor/bin/pint --test`, `npm run build`.
+- Also: `vendor/bin/pint --test`, the static analyser if the project has one
+  (Larastan, Psalm), and the front-end build and checks with the project's
+  package manager (npm, pnpm, yarn or bun: build, lint, types).
 
-Hash the build output (`public/build`, `bootstrap/ssr`) so later front-end
-changes can be compared: `find public/build bootstrap/ssr -type f | sort | xargs sha256sum > b1.sum`.
+Hash the build output (`public/build`, and `bootstrap/ssr` with Inertia SSR,
+or wherever the project builds to) so later front-end changes can be compared:
+`find public/build bootstrap/ssr -type f | sort | xargs sha256sum > b1.sum`.
 
 ## 3. Mechanical scan
 
 ```bash
-python3 ~/.claude/skills/laravel-audit-sweep/scripts/sweep.py $BASE HEAD 40
+python3 <skill>/scripts/sweep.py $BASE HEAD 40
 ```
 
 It checks every **added** line against the greppable rules and prints
-findings grouped by rule. Set `OWNER_NAMES="first|last|handle"` to include
-the owner-name check, and `PHONE_CC=90` (or another country code) for the
-phone check. Treat its output as leads: every hit is read in context before
-it is fixed or dismissed.
+findings grouped by rule. It finds the Laravel app from `artisan`; set
+`APP_DIR` when there is more than one. Optional settings:
+
+- `OWNER_NAMES="first|last|handle"` adds the owner-name check.
+- `PHONE_CC=44` checks only numbers with that country code (default: any).
+- `CLIENT_JS` and `SERVER_JS` (comma-separated path prefixes) say which JS and
+  TS ships to the browser when the defaults (`resources/js/`, `resources/ts/`,
+  `public/`, any `src/` folder; generated and config files excluded) do not fit.
+- `TOKEN_FILES` is a regex for the stylesheets allowed to define `:root` tokens.
+
+Treat its output as leads: every hit is read in context before it is fixed or
+dismissed.
 
 ## 4. Read by hand
 
@@ -75,19 +94,20 @@ The scan cannot find the expensive bugs. For every new or changed file in
 these categories, read it:
 
 1. **Authorization.** New Filament resources, pages, actions, relation
-   managers; new routes and controllers; policies. Look for: a resource with
-   no `canAccess`; a relationship `Select`/`CheckboxList` whose options are
-   scoped but whose save is not re-checked; a `->disabled()` field that is
-   still `->dehydrated()` (the browser can send any value); an action whose
-   closure does not re-check what `->visible()` checked; a table
+   managers; Livewire components; new routes and controllers; policies. Look
+   for: a resource with no `canAccess`; a relationship `Select`/`CheckboxList`
+   whose options are scoped but whose save is not re-checked; a `->disabled()`
+   field that is still `->dehydrated()` (the browser can send any value); an
+   action whose closure does not re-check what `->visible()` checked; a table
    `CreateAction` in a tenant panel (it does **not** attach the tenant, use
    `->using()`); anything scoped to "own" records that takes an id from input.
 2. **Input and output.** Mutating routes without throttle; URLs from users or
    models that get fetched (SSRF) or put in `href` (`javascript:`); raw HTML
-   output (`{!! !!}`, `v-html`) of anything a user typed; JSON-LD built by hand.
+   output (`{!! !!}`, `v-html`, `dangerouslySetInnerHTML`, `{@html}`) of
+   anything a user typed; JSON-LD built by hand; source maps served publicly.
 3. **Data.** New migrations (edited old ones, FKs without `onDelete`, `json`
-   instead of `jsonb`, type changes on big tables); new models (mass
-   assignment, missing audit logging for admin-editable ones, casts).
+   instead of `jsonb` on Postgres, type changes on big tables); new models
+   (mass assignment, missing audit logging for admin-editable ones, casts).
 4. **Personal data.** New fixtures, seeders, factories, comments.
 
 For each suspected bug: **write a failing test first** that performs the
@@ -101,21 +121,23 @@ HTTP request), then fix, then watch it pass.
   value), watch the test fail, restore. A test that has never failed proves
   nothing. Delete any probe files afterwards.
 - A fix that changes shared markup or CSS: rebuild, compare the build hashes
-  with the baseline, and explain every difference (scope-id changes from
-  editing a Vue file are expected; normalise `data-v-xxxxxxxx` before diffing).
-  Render the affected page (SSR or browser) before and after.
-- Client-side comment stripping: use `scripts/strip_comments.py`, then rebuild
-  and confirm the minified output is identical apart from scope ids.
+  with the baseline, and explain every difference (normalise generated scope
+  ids such as Vue's `data-v-xxxxxxxx` before diffing). Render the affected
+  page (SSR or browser) before and after.
+- Client-side comment stripping: `scripts/strip_comments.py` handles CSS,
+  JS/TS, Vue, Svelte, HTML and Blade. Remove JSX/TSX comments by hand. Then
+  rebuild and confirm the minified output is identical apart from scope ids.
 
 ## 6. Verify
 
-All of: full suite on the production engine, pint, build, and the guard
-tests in `templates/` present and passing. If a guard test was missing from
-the project, add it (adapt the template, prove it by breaking it).
+All of: full suite on the production engine, pint, the static analyser, the
+front-end build and checks, and the guard tests in `templates/` present and
+passing. If a guard test was missing from the project, add it (adapt the
+template, prove it by breaking it).
 
 ## 7. Report
 
-Write `temp/AUDIT-SWEEP-YYYY-MM-DD.md` (keep `temp/` gitignored):
+Write `temp/AUDIT-SWEEP-YYYY-MM-DD.md` (or another gitignored folder):
 
 - Scope (range, commit count, files, lines) and verification numbers.
 - **Fixed**: table of commit, what was wrong in plain words, rule section.
@@ -134,15 +156,16 @@ Then ask the user whether to merge or push.
 - `RULES.md`: the rulebook, sections 1 to 12.
 - `scripts/sweep.py BASE [HEAD] [LIMIT]`: scans the lines added between two
   refs. Its output is leads to read, not verdicts.
-- `scripts/strip_comments.py FILE...`: removes comments from CSS/JS/Vue
-  while leaving strings, regexes and template literals alone.
+- `scripts/strip_comments.py FILE...`: removes comments from CSS, JS/TS, Vue,
+  Svelte, HTML and Blade while leaving strings, regexes and template literals
+  alone.
 - `templates/`: guard tests to copy into a project that lacks them. Adapt the
   namespaces, then prove each one by breaking what it guards.
   - `BaseResource.php` + `ResourceAccessFailsClosedTest.php`: every Filament
     resource in every panel fails closed.
-  - `NoPersonalDataInSourceTest.php`: fixture emails and phones, national
-    ID/IBAN/card numbers, the owner's name (set `OWNER`), and roles granted
-    to a literal address.
-  - `SuperAdminGrantTest.php`: needs `'super_admin_email' =>
-    env('SUPER_ADMIN_EMAIL')` in `config/app.php` and a roles seeder that
-    grants only that address.
+  - `NoPersonalDataInSourceTest.php`: fixture emails and phones, IBANs and
+    card numbers of any country, the national IDs you list in `nationalIds()`,
+    the owner's name (set `OWNER`), and roles granted to a literal address.
+  - `SuperAdminGrantTest.php`: for spatie/laravel-permission. Needs
+    `'super_admin_email' => env('SUPER_ADMIN_EMAIL')` in `config/app.php` and
+    a roles seeder that grants only that address.

@@ -7,8 +7,9 @@ use PHPUnit\Framework\TestCase;
 /**
  * Fixtures are invented, and nothing in source points at a real person.
  *
- * Set OWNER to the owner's names and handles. The phone, ID and IBAN shapes
- * are Turkish (+90, TCKN, TR IBAN); adjust them for another country.
+ * Set OWNER to the owner's names and handles, and list the national ID shapes of
+ * the countries the project serves in nationalIds(). Phones, IBANs and card
+ * numbers are checked for every country.
  */
 class NoPersonalDataInSourceTest extends TestCase
 {
@@ -16,7 +17,7 @@ class NoPersonalDataInSourceTest extends TestCase
 
     private const FIXTURES = ['tests', 'database/seeders', 'database/factories'];
 
-    private const CODE = ['app', 'config', 'routes', 'database', 'tests', 'resources/js', 'resources/views', 'lang'];
+    private const CODE = ['app', 'config', 'routes', 'database', 'tests', 'resources/js', 'resources/ts', 'resources/views', 'lang'];
 
     /**
      * @param  array<int, string>  $roots
@@ -27,10 +28,14 @@ class NoPersonalDataInSourceTest extends TestCase
         $base = dirname(__DIR__, 2);
 
         foreach ($roots as $root) {
+            if (! is_dir("$base/$root")) {
+                continue;
+            }
+
             $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator("$base/$root", \FilesystemIterator::SKIP_DOTS));
 
             foreach ($files as $file) {
-                if (! preg_match('/\.(php|js|ts|vue|json)$/', $file->getFilename()) || $file->getRealPath() === __FILE__) {
+                if (! preg_match('/\.(php|js|ts|jsx|tsx|vue|svelte|json)$/', $file->getFilename()) || $file->getRealPath() === __FILE__) {
                     continue;
                 }
 
@@ -77,26 +82,32 @@ class NoPersonalDataInSourceTest extends TestCase
 
     public function test_fixture_phones_have_a_zeroed_subscriber(): void
     {
-        $shapes = '/(?:\+90 ?|(?<![\d.])0)?\(?[2-5]\d{2}\)? ?\d{3} ?\d{2} ?\d{2}(?![\d.])/';
+        $shapes = '/(?<![\w.+])(?:\+\d{9,14}|0\d{9,11}|(?:\+\d{1,3}[ -]?)?(?:\(?\d{2,5}\)?[ -]){1,4}\d{2,5})(?![\w.])/';
 
         $found = $this->matching(self::FIXTURES, $shapes, function (string $phone) {
+            $phone = trim($phone);
             $digits = preg_replace('/\D/', '', $phone);
 
-            // Bare ten digits with no prefix or spacing are ids and counts.
-            if (! preg_match('/[ +(]|^0/', $phone)) {
+            // Bare digit runs with no prefix or spacing are ids and counts.
+            if (strlen($digits) < 9 || strlen($digits) > 15 || ! preg_match('/[ (-]|^[+0]/', $phone)) {
                 return false;
             }
 
-            return substr(substr($digits, -10), 3, 5) !== '00000';
+            return ! str_contains(substr($digits, -8), '0000') && ! preg_match('/555[ -]?01\d\d$/', $phone);
         });
 
-        $this->assertSame([], $found, 'Write fixture numbers as 5XX 000 00 NN.');
+        $this->assertSame([], $found, 'Give fixture numbers a run of zeros in the subscriber part: +CC NNN 0000 NN.');
     }
 
     public function test_no_national_id_iban_or_card_number(): void
     {
-        $identity = $this->matching(self::CODE, '/(?<![\d.])[1-9]\d{10}(?![\d.])/', fn (string $number) => $this->isTurkishId($number));
-        $iban = $this->matching(self::CODE, '/\bTR\d{2}(?: ?\d{4}){5} ?\d{2}\b/');
+        $identity = [];
+
+        foreach ($this->nationalIds() as $pattern => $isValid) {
+            $identity = [...$identity, ...$this->matching(self::CODE, $pattern, $isValid)];
+        }
+
+        $iban = $this->matching(self::CODE, '/\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,4})?\b/', fn (string $iban) => $this->passesMod97($iban));
         $card = $this->matching(self::CODE, '/(?<!\d)[3-6](?:[ -]?\d){12,18}(?!\d)/', function (string $number) {
             $digits = preg_replace('/\D/', '', $number);
 
@@ -116,17 +127,32 @@ class NoPersonalDataInSourceTest extends TestCase
         $this->assertSame([], $this->matching(['app', 'database'], '/[\'"][^\'"@\s]+@[^\'"\s]+[\'"]\)[^;]*->assignRole/'));
     }
 
-    private function isTurkishId(string $number): bool
+    /**
+     * The national ID shapes of the countries the project serves, each with its
+     * checksum: an invented number that passes the checksum is somebody's.
+     * For example a Turkish TCKN: '/(?<![\d.])[1-9]\d{10}(?![\d.])/' => its checksum.
+     *
+     * @return array<string, \Closure(string): bool>
+     */
+    private function nationalIds(): array
     {
-        $d = array_map('intval', str_split($number));
+        return [];
+    }
 
-        if (count(array_unique($d)) === 1) {
-            return false;
+    private function passesMod97(string $iban): bool
+    {
+        $iban = str_replace(' ', '', $iban);
+        $remainder = 0;
+
+        foreach (str_split(substr($iban, 4).substr($iban, 0, 4)) as $character) {
+            $value = ctype_alpha($character) ? (string) (ord($character) - 55) : $character;
+
+            foreach (str_split($value) as $digit) {
+                $remainder = ($remainder * 10 + (int) $digit) % 97;
+            }
         }
 
-        $tenth = ((($d[0] + $d[2] + $d[4] + $d[6] + $d[8]) * 7) - ($d[1] + $d[3] + $d[5] + $d[7])) % 10;
-
-        return ($tenth + 10) % 10 === $d[9] && array_sum(array_slice($d, 0, 10)) % 10 === $d[10];
+        return $remainder === 1;
     }
 
     private function passesLuhn(string $digits): bool
