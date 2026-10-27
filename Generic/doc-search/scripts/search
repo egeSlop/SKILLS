@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Search a project's docs by meaning with EmbeddingGemma 2, served by llama.cpp (see ../SKILL.md).
+# llama.cpp runs in a container with CUDA, ROCm or Vulkan when the host has that GPU, on the CPU
+# otherwise, and natively on macOS, where containers cannot reach Metal.
+set -euo pipefail
+
+llama_build=b11913
+model_file=embeddinggemma-2-UD-Q4_K_XL.gguf
+model_url="https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/412430755667d84b1ac64fe1fe2693aa6219f1d9/$model_file"
+model_sha256=ea905fd08e8061db77a0031cbb5096d459d7cfd2bdd0ad2ba66e483f16719493
+bun_image=docker.io/oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
+
+tool="$(cd "$(dirname "$0")" && pwd)"
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cache="${DOC_SEARCH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/doc-search}"
+port="${DOC_SEARCH_PORT:-8091}"
+container=doc-search-llama
+network=doc-search
+server_args=(--embeddings --pooling mean --ctx-size 4096 --batch-size 4096 --ubatch-size 4096 --parallel 1 --no-webui)
+
+usage() {
+    cat <<'USAGE'
+Usage: search index [PATH...] [--code]   embed the docs under PATH (default: the whole project);
+                                         --code also embeds doc comments in source files
+       search "QUERY" [--top 8] [--in PATH]
+       search status | stop
+USAGE
+}
+
+engine="${DOC_SEARCH_ENGINE:-}"
+if [ -z "$engine" ]; then
+    if command -v docker >/dev/null 2>&1; then
+        engine=docker
+    elif command -v podman >/dev/null 2>&1; then
+        engine=podman
+    else
+        echo "doc-search needs Docker or Podman." >&2
+        exit 1
+    fi
+fi
+
+digest() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$@" | cut -d' ' -f1
+    else
+        sha256sum "$@" | cut -d' ' -f1
+    fi
+}
+
+project="$cache/projects/$(printf %s "$root" | digest)"
+mkdir -p "$project" "$cache/models"
+
+image() {
+    local registry=ghcr.io/ggml-org/llama.cpp
+    case "$1" in
+        cpu) echo "$registry:server-$llama_build@sha256:8ee4ec7ce58a921313d07390c6699af13aa5ec083f3cdf67e5f4155767047373" ;;
+        cuda) echo "$registry:server-cuda-$llama_build@sha256:8c219fe0367f7e794e3c69da50c5992d474077d60794a218b9e9a3b0c5aed688" ;;
+        rocm) echo "$registry:server-rocm-$llama_build@sha256:31b19613c7ae55048dd113a3f4e7d093308eb9b2370a02d4d06782102bd6ea2c" ;;
+        vulkan) echo "$registry:server-vulkan-$llama_build@sha256:3607a208ef03bc4f64515fbfac6bffc386859c14b64abec24c96f143868fcb37" ;;
+    esac
+}
+
+native_sha256() {
+    case "$1" in
+        arm64) echo d5b7b56c275624be373d2ab064b68dee2a3571e852657482cce75cbb5cb143b2 ;;
+        x64) echo b19a9c08544114b02e8e3dd688ed83f6983339e56d85aa455dd8a06df51c7c30 ;;
+    esac
+}
+
+backend() {
+    if [ -n "${DOC_SEARCH_BACKEND:-}" ]; then
+        echo "$DOC_SEARCH_BACKEND"
+    elif [ "$(uname -s)" = Darwin ]; then
+        echo native
+    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        echo cuda
+    elif [ -e /dev/kfd ] && [ "$(uname -m)" = x86_64 ]; then
+        echo rocm
+    elif [ -d /dev/dri ]; then
+        echo vulkan
+    else
+        echo cpu
+    fi
+}
+
+gpu_flags=()
+set_gpu_flags() {
+    case "$1" in
+        cuda) [ "$engine" = podman ] && gpu_flags=(--device nvidia.com/gpu=all) || gpu_flags=(--gpus all) ;;
+        rocm) gpu_flags=(--device /dev/kfd --device /dev/dri --group-add "$([ "$engine" = podman ] && echo keep-groups || echo video)") ;;
+        vulkan) gpu_flags=(--device /dev/dri) ;;
+        *) gpu_flags=() ;;
+    esac
+}
+
+# Downloads once; only a file whose checksum matched is moved into place.
+fetch() {
+    local url="$1" sum="$2" dest="$3" progress=(--silent --show-error)
+    [ -f "$dest" ] && return 0
+    [ -t 2 ] && progress=(--progress-bar)
+    echo "Downloading $(basename "$dest")" >&2
+    curl -fL --retry 3 --connect-timeout 10 "${progress[@]}" -o "$dest.part" "$url"
+    if [ "$(digest "$dest.part")" != "$sum" ]; then
+        rm -f "$dest.part"
+        echo "Checksum mismatch for $url" >&2
+        exit 1
+    fi
+    mv "$dest.part" "$dest"
+}
+
+start_native() {
+    local arch dir pid
+    arch="$([ "$(uname -m)" = x86_64 ] && echo x64 || echo arm64)"
+    dir="$cache/llama-$llama_build"
+    if [ ! -x "$dir/llama-server" ]; then
+        fetch "https://github.com/ggml-org/llama.cpp/releases/download/$llama_build/llama-$llama_build-bin-macos-$arch.tar.gz" \
+            "$(native_sha256 "$arch")" "$cache/llama-$llama_build.tar.gz"
+        tar -xzf "$cache/llama-$llama_build.tar.gz" -C "$cache"
+        rm "$cache/llama-$llama_build.tar.gz"
+    fi
+    pid="$(cat "$cache/llama.pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    echo "Starting llama.cpp on Metal" >&2
+    nohup "$dir/llama-server" "${server_args[@]}" --model "$cache/models/$model_file" \
+        --host 127.0.0.1 --port "$port" --n-gpu-layers 99 >"$cache/llama.log" 2>&1 &
+    echo $! >"$cache/llama.pid"
+}
+
+start_container() {
+    local b
+    for b in "$1" cpu; do
+        if [ "$("$engine" inspect -f '{{.State.Running}} {{index .Config.Labels "doc-search"}}' "$container" 2>/dev/null)" = "true $b-$llama_build" ]; then
+            return 0
+        fi
+        "$engine" rm -f "$container" >/dev/null 2>&1 || true
+        "$engine" network inspect "$network" >/dev/null 2>&1 || "$engine" network create "$network" >/dev/null
+        set_gpu_flags "$b"
+        echo "Starting llama.cpp in a container ($b)" >&2
+        if "$engine" run -d --rm --name "$container" --network "$network" --label "doc-search=$b-$llama_build" \
+            --security-opt label=disable ${gpu_flags[@]+"${gpu_flags[@]}"} -v "$cache/models:/models:ro" "$(image "$b")" \
+            "${server_args[@]}" --model "/models/$model_file" --host 0.0.0.0 --port 8080 \
+            --n-gpu-layers "$([ "$b" = cpu ] && echo 0 || echo 99)" >/dev/null; then
+            return 0
+        fi
+        echo "llama.cpp did not start with $b; trying the CPU. DOC_SEARCH_BACKEND chooses." >&2
+    done
+    exit 1
+}
+
+stop() {
+    local pid
+    pid="$(cat "$cache/llama.pid" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$cache/llama.pid"
+    "$engine" rm -f "$container" >/dev/null 2>&1 || true
+}
+
+# Git's view of the project when there is one, so ignored files stay out.
+list_files() {
+    if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        git -C "$root" ls-files --cached --others --exclude-standard -- "$@"
+    else
+        (cd "$root" && find "$@" \( -name .git -o -name node_modules -o -name vendor -o -name target -o -name dist -o -name build \) -prune \
+            -o -type f -print | sed 's|^\./||')
+    fi
+}
+
+status() {
+    local pid
+    echo "Project:  $root"
+    echo "Scope:    $(tr '\n' ' ' <"$project/scope" 2>/dev/null || echo "not indexed yet")"
+    echo "Backend:  $(backend) ($engine)"
+    pid="$(cat "$cache/llama.pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "Server:   running natively (log: $cache/llama.log)"
+    elif [ "$("$engine" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" = true ]; then
+        echo "Server:   running in $container ($engine logs $container)"
+    else
+        echo "Server:   stopped"
+    fi
+}
+
+mode=query
+case "${1:-}" in
+    "" | -h | --help | help) usage; exit 0 ;;
+    stop) stop; exit 0 ;;
+    status) status; exit 0 ;;
+    index)
+        mode=index
+        shift
+        paths=()
+        code=false
+        for arg in "$@"; do
+            [ "$arg" = --code ] && code=true || paths+=("$arg")
+        done
+        [ ${#paths[@]} -gt 0 ] || paths=(.)
+        printf '%s\n' "--code=$code" "${paths[@]}" >"$project/scope"
+        set --
+        ;;
+esac
+
+[ -f "$project/scope" ] || printf '%s\n' --code=false . >"$project/scope"
+scope=()
+while IFS= read -r line; do scope+=("$line"); done <"$project/scope"
+list_files "${scope[@]:1}" >"$project/files.txt"
+
+fetch "$model_url" "$model_sha256" "$cache/models/$model_file"
+
+client_flags=()
+if [ "$(backend)" = native ]; then
+    start_native
+    client_flags=(--add-host host.docker.internal:host-gateway -e "SEARCH_URL=http://host.docker.internal:$port"
+        -e "SEARCH_LOG=$cache/llama.log")
+else
+    start_container "$(backend)"
+    client_flags=(--network "$network" -e "SEARCH_URL=http://$container:8080" -e "SEARCH_LOG=$engine logs $container")
+fi
+
+# Rootless engines map container root to you; a rootful one needs your IDs to keep the cache yours.
+if [ "$engine" = podman ]; then
+    rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+else
+    rootless="$(docker info --format '{{join .SecurityOptions " "}}' 2>/dev/null | grep -o rootless || true)"
+fi
+[ -n "$rootless" ] && [ "$rootless" != false ] && client_flags+=(--user 0:0) || client_flags+=(--user "$(id -u):$(id -g)")
+
+tty_flags=()
+[ -t 1 ] && [ -t 2 ] && tty_flags=(-t)
+exec "$engine" run --rm ${tty_flags[@]+"${tty_flags[@]}"} "${client_flags[@]}" --security-opt label=disable \
+    -e HOME=/tmp -v "$root:/work:ro" -v "$tool:/tool:ro" -v "$project:/cache" -w /work \
+    "$bun_image" bun /tool/search.ts "$mode" "${scope[0]}" "$@"
